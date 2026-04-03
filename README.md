@@ -33,7 +33,7 @@ This documents my experience standing up a two-node GB10 inference cluster with 
        │                        │
   ┌────┴────────────────────────┴────┐
   │      Fabric Switch (L2 spine)    │
-  │      VLAN 30 · 10.x.x.0/24      │
+  │      VLAN 30 · 10.x.x.0/24       │
   │      MTU 9200 · RoCE             │
   └──────────────────────────────────┘
 ```
