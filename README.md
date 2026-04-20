@@ -168,15 +168,38 @@ The second RDMA device (`roceP2p1s0f0`, corresponding to `enP2p1s0f0np0`) doesn'
 
 Assign a routable IPv4 address to `enP2p1s0f0np0` on **both** nodes (see the netplan examples in Issue 1). Both HCA interfaces must be on the same subnet so their RDMA GIDs are both IPv4-mapped.
 
-### Workaround
+### Workaround: single-HCA configuration
 
-If you can't assign IPs to the second HCA, restrict NCCL to only the first:
+If you can't assign IPs to the second HCA — or if a second fabric IP on the same
+subnet conflicts with other services on your hosts (see Issue 7 below) — restrict
+NCCL to only the first:
 
 ```bash
 export NCCL_IB_HCA=rocep1s0f0   # Single HCA only
 ```
 
-This works but limits you to half the available RDMA bandwidth.
+This is a deliberate tradeoff, not a broken state. You'll measure roughly half
+the dual-HCA peak bandwidth (~13.9 GB/s busbw vs ~22 GB/s). The path still fully
+exercises RoCEv2 over the fabric, and all the other Issues in this guide still
+apply — you just aggregate over one HCA instead of two.
+
+**When to pick single-HCA deliberately:**
+
+- The second HCA's fabric IP would conflict with routing for other services
+  (e.g., NFS exports authorized on only one IP per host)
+- You're running a shared-subnet deployment where a second IP per host
+  creates ECMP/routing ambiguity for the upstream switch
+- You've decided 13.9 GB/s is sufficient for your workload and the simpler
+  config is worth the bandwidth tradeoff
+
+**Validate-fabric pattern:**
+
+If you build a validation harness, filter out HCAs that come up PORT_ACTIVE
+but with `active_mtu` below your expected fabric MTU (e.g., 1024 when you
+expect 4096). An HCA in that state will return error-path busbw if you try to
+use it — better to reject it at inventory time and report "single HCA
+operating, aggregate skipped" than to report a failing test. I'll publish the
+validator pattern separately if there's interest.
 
 ---
 
@@ -248,6 +271,86 @@ The actual errors users encounter — GID mismatches, `ibv_modify_qp` failures, 
 
 ---
 
+## Issue 7: Second HCA IP Can Break NFS When NetworkManager Reacquires It Post-Reboot
+
+### Symptoms
+
+Dual-HCA fabric works fine. Then you reboot, and suddenly NFS mounts to the
+head node start failing with access-denied errors — even though nothing about
+your NFS config changed. The fabric still pings end-to-end. Both HCAs still
+show UP. You've done nothing visibly wrong.
+
+### The problem
+
+If your fabric subnet has a DHCP server anywhere on it — which may be the case
+if you're running through a MikroTik switch with a DHCP pool on the VLAN —
+NetworkManager can auto-acquire a second IP on `enP2p1s0f0np0` post-reboot,
+assigning it a DHCP-leased address alongside the static IP your netplan
+declares.
+
+The new DHCP-leased IP typically comes in with route **metric 100** (NM
+default), while your netplan-configured static IP on `enp1s0f0np0` sits at
+**metric 101**. That single-digit metric difference silently flips the kernel's
+choice of source IP for egress traffic to the fabric subnet. NFS mount requests
+now source from the DHCP-assigned IP instead of the fabric static IP — and
+since your NFS `/etc/exports` only authorizes the static IP, every mount
+request gets rejected with `badauth`.
+
+Concretely, the failure mode I hit:
+
+- `/etc/exports` authorizes only `<head-ip>`
+- Post-reboot, worker's `enP2p1s0f0np0` DHCP-acquires `10.x.x.94`
+- NFS mount traffic sources from `.94` instead of `.11`
+- Head node rejects all mount RPCs
+- `badauth` counter in `/proc/net/rpc/nfsd` increments on every attempt
+
+The fabric RDMA layer keeps working fine throughout this — the problem is
+purely at the IP routing layer. But vLLM, if it's model-loading from NFS,
+will hang or fail at startup.
+
+### The fix
+
+Add a netplan file that explicitly disables DHCP on the second HCA interface
+while leaving it available for fabric-layer use:
+
+```yaml
+# /etc/netplan/50-disable-port2.yaml
+network:
+  version: 2
+  ethernets:
+    enP2p1s0f0np0:
+      dhcp4: false
+      dhcp6: false
+      optional: true
+```
+
+`dhcp4: false` and `dhcp6: false` prevent NetworkManager from auto-acquiring
+addresses; `optional: true` prevents netplan from blocking boot if the
+interface isn't ready.
+
+Note this doesn't assign the fabric-path static IP — if you want dual-HCA
+bandwidth, keep the full `40-cx7.yaml` stanza from Issue 1 (which does
+assign a static IP). `50-disable-port2.yaml` is the defense-in-depth layer
+that belts-and-suspenders the DHCP prevention.
+
+### Why the playbook doesn't mention this
+
+NVIDIA's playbook assumes a direct-connect topology with no DHCP server
+anywhere on the fabric. In that environment, NM has nothing to auto-acquire
+from, so the bug is unreachable. It only manifests when your switched fabric
+shares a VLAN or subnet with a DHCP pool — which is normal in any non-trivial
+lab or production network.
+
+### Single-HCA with this fix
+
+If you're running the Issue 3 single-HCA workaround because the dual-IP
+config caused routing conflicts you couldn't otherwise resolve, the
+`50-disable-port2.yaml` pattern above is sufficient — you keep the second HCA
+from acquiring any IP, the fabric L3 only has one IP per host, and NFS
+routing is unambiguous.
+
+---
+
 ## Validated NCCL Test Results (Through Switch)
 
 After applying all fixes, here are the `all_gather_perf` results through the MikroTik CRS812 L2 switch with both HCAs active:
@@ -263,6 +366,22 @@ After applying all fixes, here are the `all_gather_perf` results through the Mik
 | 16 GB       | 20.3        | 81%                      |
 
 Peak bandwidth of **~22 GB/s** (87% of theoretical) at 2–4 GB buffer sizes, consistent with community-reported results on direct-connect setups. The slight dip at 16 GB is due to memory pressure on GB10's unified memory architecture.
+
+### Single-HCA comparison
+
+For the single-HCA configuration described in Issue 3's workaround, expect
+roughly half the peak bandwidth. Representative numbers from my current
+deployment (`NCCL_IB_HCA=rocep1s0f0` only, through the MikroTik CRS812):
+
+| Configuration | Peak busbw | % of dual-HCA | % of theoretical |
+|---|---|---|---|
+| Dual-HCA (both CX-7 first ports, both on fabric L3) | ~22 GB/s | 100% | 87% |
+| Single-HCA (one CX-7 first port) | ~13.9 GB/s | 63% | 56% |
+
+The single-HCA result exceeds 22 / 2 = 11 GB/s because NCCL's aggregate isn't
+strict 2× per-HCA — there's protocol overhead that doesn't scale linearly. The
+63% ratio is consistent across buffer sizes from 8 MB to 4 GB; the shape of the
+curve is the same as the dual-HCA table, just shifted down.
 
 ---
 
